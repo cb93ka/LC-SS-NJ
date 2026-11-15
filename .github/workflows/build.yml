@@ -1,0 +1,130 @@
+
+name: Build LiveContainer + SideStore
+
+on:
+  workflow_dispatch:
+    inputs:
+      ss_repo:
+        description: SideStore repository
+        required: true
+        default: SideStore/SideStore
+      ss_tag:
+        description: SideStore release tag
+        required: true
+        default: nightly
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Install dependencies
+        run: |
+          brew install ldid
+
+      - name: Download and build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SS_REPO: ${{ inputs.ss_repo }}
+          SS_TAG: ${{ inputs.ss_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          W=$(mktemp -d)
+          trap 'rm -rf "$W"' EXIT
+
+          OUT="$GITHUB_WORKSPACE/LiveContainer+SideStore-experimental.ipa"
+
+          cd "$W"
+
+          gh release download nightly \
+            --repo LiveContainer/LiveContainer \
+            -p 'LiveContainer+SideStore.ipa' \
+            -O lc.ipa
+
+          gh release download "$SS_TAG" \
+            --repo "$SS_REPO" \
+            -p 'SideStore.ipa' \
+            -O ss.ipa
+
+          mkdir lc ss dylibify
+
+          (cd lc && unzip -q ../lc.ipa)
+          (cd ss && unzip -q ../ss.ipa)
+
+          gh api repos/LiveContainer/dylibify/contents/main.m \
+            --jq .content | base64 -d > dylibify/main.m
+
+          clang dylibify/main.m \
+            -framework Foundation \
+            -fobjc-arc \
+            -o dylibify/dylibify
+
+          APP=lc/Payload/LiveContainer.app
+          F=$APP/Frameworks/SideStoreApp.framework
+
+          cp "$F/LCAppInfo.plist" LCAppInfo.plist
+
+          rm -rf "$F"
+          cp -R ss/Payload/SideStore.app "$F"
+
+          dylibify/dylibify "$F/SideStore" "$F/SideStore.dylib"
+          rm "$F/SideStore"
+          mv "$F/SideStore.dylib" "$F/SideStore"
+
+          ldid -S"" "$F/SideStore"
+
+          cp LCAppInfo.plist "$F/"
+
+          cp "$F/Intents.intentdefinition" "$F/ViewApp.intentdefinition" "$APP/"
+
+          rm -rf "$APP/Metadata.appintents"
+          cp -R "$F/Metadata.appintents" "$APP/Metadata.appintents"
+
+          sed -i '' \
+            's/9SideStore20RefreshAllAppsIntentV/16SideStoreSupport20RefreshAllAppsIntentV/g' \
+            "$APP/Metadata.appintents/extract.actionsdata"
+
+          sed -i '' \
+            's/9SideStore26RefreshAllAppsWidgetIntentV/16SideStoreSupport26RefreshAllAppsWidgetIntentV/g' \
+            "$APP/Metadata.appintents/extract.actionsdata"
+
+          WX=$APP/PlugIns/LiveWidgetExtension.appex
+
+          rm -rf "$WX"
+          mv "$F/PlugIns/AltWidgetExtension.appex" "$WX"
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleIdentifier com.kdt.livecontainer.LiveWidget" \
+            "$WX/Info.plist"
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleExecutable LiveWidgetExtension" \
+            "$WX/Info.plist"
+
+          mv "$WX/AltWidgetExtension" "$WX/LiveWidgetExtension"
+
+          gh api repos/LiveContainer/LiveContainer/contents/.github/sidelc/LiveWidgetExtension_adhoc.xml \
+            --jq .content | base64 -d > widget.xml
+
+          ldid -Swidget.xml "$WX/LiveWidgetExtension"
+
+          cd lc
+          zip -qr "$OUT" Payload \
+            -x "._*" \
+            -x ".DS_Store" \
+            -x "__MACOSX"
+
+          echo "IPA created: $OUT"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiveContainer-SideStore-IPA
+          path: LiveContainer+SideStore-experimental.ipa
+          if-no-files-found: error
+          retention-days: 7
